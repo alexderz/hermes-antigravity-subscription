@@ -60,24 +60,39 @@ class SetupStatusTest(unittest.TestCase):
         self.assertFalse(status["logged_in"])
         self.assertEqual(status["detail"], setup_hooks.INSTALL_HINT)
 
-    def test_signed_in_via_usage_read(self):
-        usage = "Gemini Models\tFive Hour Limit Remaining\t62%\t2026-11-24T05:51:46Z\n"
-
-        def fake_helpers():
-            return (lambda: {}, lambda: "agy", lambda: None)
-
-        with patch.object(setup_hooks, "_helpers", side_effect=fake_helpers), patch.object(
-            setup_hooks, "_usage_probe", return_value=usage
+    def test_token_file_is_enough(self):
+        """A headless host signs in to a file; the usage read only adds detail."""
+        with patch.object(setup_hooks, "_helpers", return_value=(lambda: {}, lambda: "agy", lambda: "/token")), patch.object(
+            setup_hooks, "_usage_snapshot", return_value=None
         ):
             status = setup_hooks.setup_status()
         self.assertTrue(status["available"])
         self.assertTrue(status["logged_in"])
+        self.assertEqual(status["detail"], "")
+
+    def test_usage_snapshot_adds_detail(self):
+        class Bucket:
+            window = "5h"
+            remaining_fraction = 0.62
+
+        class Group:
+            name = "Gemini Models"
+            buckets = [Bucket()]
+
+        class Snapshot:
+            groups = [Group()]
+
+        with patch.object(setup_hooks, "_helpers", return_value=(lambda: {}, lambda: "agy", lambda: None)), patch.object(
+            setup_hooks, "_usage_snapshot", return_value=Snapshot()
+        ):
+            status = setup_hooks.setup_status()
+        self.assertTrue(status["logged_in"], "a successful usage read proves a sign-in")
         self.assertIn("62%", status["detail"])
         self.assertIsNone(status["login_command"], "agy has no non-interactive login verb")
 
     def test_signed_out(self):
         with patch.object(setup_hooks, "_helpers", return_value=(lambda: {}, lambda: "agy", lambda: None)), patch.object(
-            setup_hooks, "_usage_probe", return_value=None
+            setup_hooks, "_usage_snapshot", return_value=None
         ):
             status = setup_hooks.setup_status()
         self.assertFalse(status["logged_in"])

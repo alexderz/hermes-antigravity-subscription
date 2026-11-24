@@ -85,6 +85,13 @@ class CacheTest(unittest.TestCase):
         with patch.object(hc, "agy_version", return_value="1.5.15"):
             self.assertEqual(hc.load_cached_windows(), {})
 
+    def test_base_id_falls_back_to_a_variant(self):
+        """A base asked for before it was ever current borrows its variant's value."""
+        self._write({"gemini-4-neon-high": 1_048_576})
+        with patch.object(hc, "agy_version", return_value="1.5.15"):
+            self.assertEqual(hc.lookup("gemini-4-neon"), 1_048_576)
+            self.assertEqual(hc.lookup("gemini-4-neon-high"), 1_048_576)
+
     def test_lookup_missing_cache(self):
         self.assertIsNone(hc.lookup("gemini-4-neon"))
 

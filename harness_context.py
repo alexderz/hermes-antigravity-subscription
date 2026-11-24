@@ -376,6 +376,11 @@ def discover_windows(timeout: float = _DISCOVERY_TIMEOUT) -> dict[str, int]:
                 shutil.rmtree(isolated_home, ignore_errors=True)
             except Exception:
                 pass
+    # A variant's value covers its base: `gemini-4-neon-high` (1M) is also the
+    # window of `gemini-4-neon`, which may never be the current model itself.
+    for model_id, size in list(windows.items()):
+        base, _effort = _split_effort(model_id)
+        windows.setdefault(base, size)
     if windows:
         logger.info("agy reported context windows for %d models: %s", len(windows), dict(sorted(windows.items())[:4]))
     return windows
@@ -414,11 +419,24 @@ def lookup(model: str) -> Optional[int]:
         return None
     if name in windows:
         return windows[name]
+    # An effort variant shares its base model's window; try the base early so a
+    # cold cache keyed only by another variant still answers.
+    base, _effort = _split_effort(name)
+    if base != name and base in windows:
+        return windows[base]
     best: tuple[int, int] | None = None
     for cached, size in windows.items():
         if name.startswith(cached) and (best is None or len(cached) > best[0]):
             best = (len(cached), size)
-    return best[1] if best else None
+    if best is not None:
+        return best[1]
+    # A base id asked for before any variant of it was the current model: take
+    # the window of the closest variant that extends the name.
+    variants = [(cached, size) for cached, size in windows.items() if cached.startswith(name)]
+    if variants:
+        shortest = min(variants, key=lambda item: len(item[0]))
+        return shortest[1]
+    return None
 
 
 def reset_memo() -> None:

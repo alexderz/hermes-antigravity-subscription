@@ -29,44 +29,35 @@ def _helpers():
     return _no_window, resolve_agy_command, resolve_real_token_path
 
 
-def _usage_probe(timeout: float) -> Optional[str]:
-    """Run the CLI's free `usage` read; return its raw response or None."""
-    _no_window, resolve_agy_command, _token = _helpers()
+def _usage_snapshot(timeout: float):
+    """The CLI's free `/usage` read (isolated home, cached), or None.
+
+    `agy usage` is not a subcommand; the quota table comes from a print-mode
+    slash command, which is what the provider's usage module already wraps.
+    """
     try:
-        run = subprocess.run(
-            [resolve_agy_command(), "usage"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-            **_no_window(),
-        )
-    except (OSError, subprocess.SubprocessError):
+        try:
+            from .usage import fetch_subscription_usage
+        except ImportError:
+            from usage import fetch_subscription_usage  # type: ignore[no-redef]
+        return fetch_subscription_usage(timeout=timeout)
+    except Exception as exc:  # pragma: no cover - CLI/parse failures
+        logger.debug("Antigravity usage probe failed: %s", exc)
         return None
-    text = (run.stdout or "").strip()
-    if not text:
-        return None
-    # A signed-out CLI answers with an auth error rather than a usage table.
-    lowered = text.lower()
-    if "not logged" in lowered or "sign in" in lowered or "authentication" in lowered:
-        return None
-    return text
 
 
-def _quota_detail(raw: str) -> str:
-    """One line from the usage table, e.g. `Gemini (5h): 62% remaining`."""
-    best = ""
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if "remaining" in line.lower():
-            best = line.replace("\t", " ").strip()
-            if "5h" in line.lower() or "5 hour" in line.lower():
-                return best
-    return best
+def _quota_detail(snapshot) -> str:
+    """One short line from the usage snapshot, e.g. `Gemini Models 5h: 62% left`."""
+    try:
+        for group in getattr(snapshot, "groups", []) or []:
+            for bucket in getattr(group, "buckets", []) or []:
+                window = str(getattr(bucket, "window", "")).lower()
+                if "5h" in window or "5 hour" in window:
+                    remaining = round(float(bucket.remaining_fraction) * 100)
+                    return f"{group.name} 5h: {remaining}% left"
+        return ""
+    except Exception:
+        return ""
 
 
 def setup_status(command: Any = None, env: Optional[dict[str, str]] = None, timeout: float = 15.0) -> dict[str, Any]:
@@ -84,31 +75,23 @@ def setup_status(command: Any = None, env: Optional[dict[str, str]] = None, time
             "detail": INSTALL_HINT,
             "login_command": None,
         }
-    # File-based sign-in is the norm on a headless host; a keyring-only token
-    # returns None here and is confirmed by the free usage read below.
-    logged_in = False
+    # A token file is the authoritative sign-in evidence on a headless host. A
+    # keyring-only install has none, so the free usage read decides instead.
     try:
         logged_in = bool(resolve_real_token_path())
     except Exception:
         logged_in = False
-    detail = ""
+    snapshot = _usage_snapshot(timeout)
+    if snapshot is not None:
+        logged_in = True
+    detail = _quota_detail(snapshot) if snapshot is not None else ""
     if not logged_in:
-        raw = _usage_probe(timeout)
-        if raw:
-            logged_in = True
-            detail = _quota_detail(raw)
-    else:
-        raw = _usage_probe(timeout)
-        if raw:
-            detail = _quota_detail(raw)
-        else:
-            logged_in = False
-            detail = LOGIN_HINT
+        detail = LOGIN_HINT
     return {
         "available": True,
         "logged_in": logged_in,
         "plan": "Antigravity",
-        "detail": detail if logged_in else (detail or LOGIN_HINT),
+        "detail": detail,
         # The CLI signs in interactively; there is no non-interactive login verb.
         "login_command": None,
     }
