@@ -39,14 +39,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Single-turn prompt ceiling measured against agy 1.x (issue #49): the CLI
-# silently truncates a Gemini-route prompt at ~75,800 input tokens, keeps the
-# head and drops the tail, and reports no error. In an agent loop the tail is
-# the fresh tool output, so Hermes must compact before agy starts discarding
-# it. Claude routes accepted >122k input with no observed cap below the
-# compiled multi-turn trajectory threshold, so they keep the full default.
-_GEMINI_SINGLE_TURN_CONTEXT = 75_000
-_DEFAULT_CONTEXT_LENGTH = 239_000
+# Context accounting lives in agy_context: the single-prompt-frame cap is a
+# measured BYTE limit (191,583 bytes on agy 1.5.15), not a per-family token
+# guess, and continuation turns send only a delta through --conversation. The
+# declared window is therefore the trajectory checkpoint for every family, and
+# the frame cap is enforced where the prompt is built (prompt.py).
+try:  # plugin package import
+    from .agy_context import TRAJECTORY_CONTEXT as _DEFAULT_CONTEXT_LENGTH
+except ImportError:  # standalone import (tests, plugin dev)
+    from agy_context import TRAJECTORY_CONTEXT as _DEFAULT_CONTEXT_LENGTH  # type: ignore[no-redef]
 _CONTEXT_LENGTH_OVERRIDE_VARS = (
     "HERMES_ANTIGRAVITY_CONTEXT_LENGTHS",
     "ANTIGRAVITY_CONTEXT_LENGTHS",
@@ -80,19 +81,24 @@ def _context_length_overrides() -> dict[str, int]:
 
 
 def resolve_context_length(model: str) -> int:
-    """Single-turn context length for *model*, per-family where measured.
+    """Declared context for *model*: the multi-turn trajectory checkpoint.
 
-    Exact-name overrides beat family overrides; the measured Gemini ceiling
-    (75k, head-kept truncation) applies to every ``gemini-*`` route, effort
-    suffixes included.
+    One number for every family, because the binding limit is not per-model any
+    more. A live conversation persists through ``agy --conversation`` and each
+    turn sends only its delta, so the limit a session can grow to is agy's
+    compiled trajectory checkpoint (239,616 tokens) less the 16k output
+    reserve. The single-prompt-frame byte cap (191,583 bytes measured on agy
+    1.5.15) is enforced in :mod:`prompt` by fitting each frame to a budget, so a
+    full send can no longer be silently cut by the transport.
+
+    Overrides still win, exact name first and then the effort-stripped family
+    name, so a pinned number in ``*_CONTEXT_LENGTHS`` overrides this.
     """
     base, _effort = split_effort_suffix(model.strip().lower())
     overrides = _context_length_overrides()
     for name in (model.strip().lower(), base):
         if name and name in overrides:
             return overrides[name]
-    if base.startswith("gemini"):
-        return _GEMINI_SINGLE_TURN_CONTEXT
     return _DEFAULT_CONTEXT_LENGTH
 
 
@@ -164,22 +170,24 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         return list(_FALLBACK_MODELS)
 
     def get_model_context_length(self, model: str) -> int | None:
-        """Declared context window for Antigravity CLI, per model family.
+        """Declared context window for Antigravity CLI.
 
-        Gemini routes declare 75,000 tokens: agy 1.x silently truncates a
-        single-turn Gemini prompt at ~75,800 input tokens, keeps the head and
-        drops the tail (issue #49), so Hermes compaction must fire below that.
-        Claude routes have no observed single-turn cap under the compiled
-        trajectory threshold and keep the 239,000 default (239,616 tokens /
-        256k - 16k output tokens). Multi-turn trajectory persistence via
-        native --conversation prevents hitting the single-turn limit.
+        Returns the trajectory checkpoint (239,000 tokens) for every model: a
+        live conversation sends only deltas through ``agy --conversation``, so
+        that checkpoint, not the model's advertised window and not a
+        per-family guess, is what Hermes should compact against. The transport
+        does cap a *single* prompt frame at a measured 191,583 bytes, and that
+        is handled where the prompt is assembled (:mod:`prompt` fits every
+        frame to a byte budget and learns the real cap from any truncation agy
+        reports), not by declaring a smaller window.
 
         Overrides: ``HERMES_ANTIGRAVITY_CONTEXT_LENGTH`` /
         ``ANTIGRAVITY_CONTEXT_LENGTH`` set one global value;
         ``HERMES_ANTIGRAVITY_CONTEXT_LENGTHS`` /
         ``ANTIGRAVITY_CONTEXT_LENGTHS`` take a JSON object mapping a model
         name or family prefix (e.g. ``"gemini-4-argon"``) to a token count.
-        The global override wins over the per-model table.
+        The global override wins over the per-model table. Prompt sizing:
+        ``HERMES_ANTIGRAVITY_PROMPT_BYTES`` / ``ANTIGRAVITY_PROMPT_BYTES``.
         """
         env_val = os.environ.get("HERMES_ANTIGRAVITY_CONTEXT_LENGTH") or os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:

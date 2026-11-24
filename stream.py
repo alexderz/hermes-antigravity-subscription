@@ -46,6 +46,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+try:  # plugin package import
+    from .agy_context import note_truncation
+except ImportError:  # standalone import (tests, plugin dev)
+    from agy_context import note_truncation  # type: ignore[no-redef]
+
 # agy's media pipeline attaches pixels THROUGH a native read: the model calls
 # read_file/view_file on the path referenced as [Image](path) and the CLI then
 # inlines the file as a media block into the turn. Blanket-neutralizing every
@@ -224,6 +229,7 @@ class AntigravityStream(Iterator[Any]):
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
         prompt_chars: int = 0,
+        prompt_bytes: int = 0,
         delivery_watch: Any = None,
         delivery_sample_key: str = "",
     ):
@@ -269,6 +275,9 @@ class AntigravityStream(Iterator[Any]):
         # Size of the prompt this stream's process was fed, so the usage chunk
         # can be checked against it (delivery.py, issue #29).
         self.prompt_chars = max(int(prompt_chars or 0), 0)
+        # UTF-8 size of the same prompt: agy's per-frame cap is counted in
+        # bytes, and a truncation notice is checked against this number.
+        self.prompt_bytes = max(int(prompt_bytes or 0), 0) or self.prompt_chars
         # Captured per request, not looked up on a mutable client at completion.
         # Worker deltas and concurrent oneshots must never share samples.
         self.delivery_watch = delivery_watch
@@ -944,6 +953,12 @@ class AntigravityStream(Iterator[Any]):
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.
                     final_resp = res.get("response", "")
+                    if final_resp:
+                        # agy names any prompt it cut ("N bytes truncated").
+                        # Record it and learn the real frame cap from the
+                        # surviving size, so the next prompt is sized against
+                        # what this build actually accepts.
+                        note_truncation(final_resp, self.prompt_bytes)
                     if final_resp and not has_content and not has_tool_calls and not text_buffer:
                         text_buffer = final_resp
                     # POSITIVE success evidence only: status SUCCESS *and* an

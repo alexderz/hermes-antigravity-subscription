@@ -35,6 +35,21 @@ except ImportError:  # standalone use (tests, plugin dev)
 
 logger = logging.getLogger(__name__)
 
+try:  # plugin package import
+    from .agy_context import (
+        hard_trim,
+        omitted_notice,
+        prompt_byte_budget,
+        prompt_bytes,
+    )
+except ImportError:  # standalone import (tests, plugin dev)
+    from agy_context import (  # type: ignore[no-redef]
+        hard_trim,
+        omitted_notice,
+        prompt_byte_budget,
+        prompt_bytes,
+    )
+
 # Media materialized for agy lives under the active Hermes home (profile-aware)
 # and is deleted when the owning client session closes. The dir is resolved at
 # USE time, not at import: one Hermes process can serve several profiles, and
@@ -930,6 +945,54 @@ def _tool_loop_objective_section(user_text: str) -> str:
     )
 
 
+#: Structured shrink ladder, mildest first. Each pass re-renders the transcript
+#: with tighter caps; the first rendering that fits the budget wins. Level 0 is
+#: the historical behaviour, so a short prompt is byte-for-byte what it was.
+_SHRINK_LEVELS: tuple[dict[str, int], ...] = (
+    {
+        "recent_tools": 8,
+        "historical_tool_chars": 300,
+        "tool_chars_cap": 20_000,
+        "text_chars_cap": 0,
+        "keep_messages": 0,
+    },
+    {
+        "recent_tools": 4,
+        "historical_tool_chars": 120,
+        "tool_chars_cap": 8_000,
+        "text_chars_cap": 6_000,
+        "keep_messages": 0,
+    },
+    {
+        "recent_tools": 2,
+        "historical_tool_chars": 60,
+        "tool_chars_cap": 2_000,
+        "text_chars_cap": 2_000,
+        "keep_messages": 80,
+    },
+    {
+        "recent_tools": 1,
+        "historical_tool_chars": 0,
+        "tool_chars_cap": 1_000,
+        "text_chars_cap": 800,
+        "keep_messages": 24,
+    },
+)
+
+
+def _cap_text(text: str, cap: int) -> str:
+    """Middle-truncate prose to *cap* characters, keeping both ends and saying so."""
+    if cap <= 0 or len(text) <= cap:
+        return text
+    head = cap // 2
+    tail = cap - head
+    return (
+        text[:head]
+        + f"\n[... {len(text)} chars truncated to fit the prompt budget ...]\n"
+        + text[-tail:]
+    )
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -937,7 +1000,39 @@ def _format_messages_as_prompt(
     tool_choice: Any = None,
     media_sink: Optional[set] = None,
 ) -> str:
-    """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt."""
+    """Assemble the prompt for one full send, fitted to agy's frame budget.
+
+    ``agy`` keeps only the first ~191.6 KB of a single prompt frame and names the
+    cut in its reply (see :mod:`agy_context`). A continuation turn sends a small
+    delta and never meets that cap, but the first turn of a conversation, and
+    any turn after a worker reset, send the whole transcript. This walks the
+    shrink ladder and returns the first rendering that fits, instead of letting
+    the transport decide which of our tokens to drop.
+    """
+    budget = prompt_byte_budget()
+    text = ""
+    for level in _SHRINK_LEVELS:
+        text = _render_prompt(messages, tools, tool_choice, media_sink, level=level)
+        if prompt_bytes(text) <= budget:
+            return text
+    logger.warning(
+        "Prompt is still %d bytes over the %d-byte budget after every shrink step; "
+        "trimming the middle of the transcript.",
+        prompt_bytes(text) - budget,
+        budget,
+    )
+    return hard_trim(text, budget)
+
+
+def _render_prompt(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: Any,
+    media_sink: Optional[set],
+    *,
+    level: dict[str, int],
+) -> str:
+    """Render the canonical prompt at one point of the shrink ladder."""
     try:
         from agent.acp_openai_bridge import render_tool_bridge_sections
         tool_sections = render_tool_bridge_sections(tools, tool_choice)
@@ -970,13 +1065,21 @@ def _format_messages_as_prompt(
     if system_parts:
         sections.append("### SYSTEM INSTRUCTIONS (HERMES AGENT):\n" + "\n\n".join(f"System:\n{p}" for p in system_parts))
 
-    _HISTORICAL_TOOL_RETENTION_COUNT = 8
-    _HISTORICAL_TOOL_MAX_CHARS = 300
-    _TOOL_MAX_CHARS_CAP = 20000
+    _HISTORICAL_TOOL_RETENTION_COUNT = level["recent_tools"]
+    _HISTORICAL_TOOL_MAX_CHARS = level["historical_tool_chars"]
+    _TOOL_MAX_CHARS_CAP = level["tool_chars_cap"]
+    _TEXT_CHARS_CAP = level["text_chars_cap"]
+    _KEEP_MESSAGES = level["keep_messages"]
 
     transcript: list[str] = []
     recovery_turn = last_role == "user" and last_msg is not None and _is_recovery_nudge(last_msg)
     prior_messages = history_messages[:-1] if last_role == "user" and not recovery_turn and len(history_messages) > 1 else history_messages
+
+    omitted = 0
+    if _KEEP_MESSAGES and len(prior_messages) > _KEEP_MESSAGES:
+        omitted = len(prior_messages) - _KEEP_MESSAGES
+        prior_messages = prior_messages[-_KEEP_MESSAGES:]
+        sections.append(omitted_notice(omitted, prompt_byte_budget()))
 
     tool_indices = [
         i for i, msg in enumerate(prior_messages)
@@ -995,16 +1098,23 @@ def _format_messages_as_prompt(
         if role == "tool":
             tool_id = str(message.get("tool_call_id") or message.get("name") or "tool").strip()
             if i not in recent_tool_cutoff and len(rendered_content) > _HISTORICAL_TOOL_MAX_CHARS:
-                rendered_content = (
-                    rendered_content[:200]
-                    + f"\n[... tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-100:]
-                )
+                if _HISTORICAL_TOOL_MAX_CHARS <= 0:
+                    rendered_content = (
+                        f"[... tool output omitted: {len(rendered_content)} chars over the prompt budget ...]"
+                    )
+                else:
+                    rendered_content = (
+                        rendered_content[:200]
+                        + f"\n[... tool output truncated: {len(rendered_content)} chars ...]\n"
+                        + rendered_content[-100:]
+                    )
             elif len(rendered_content) > _TOOL_MAX_CHARS_CAP:
+                head = max(int(_TOOL_MAX_CHARS_CAP * 0.6), 200)
+                tail = max(_TOOL_MAX_CHARS_CAP - head, 100)
                 rendered_content = (
-                    rendered_content[:12000]
+                    rendered_content[:head]
                     + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-3000:]
+                    + rendered_content[-tail:]
                 )
             transcript.append(f"Tool Result ({tool_id}):\n{rendered_content}")
             continue
@@ -1013,6 +1123,7 @@ def _format_messages_as_prompt(
             parts = []
             if "Tool Result (" in rendered_content:
                 rendered_content = rendered_content.split("Tool Result (")[0].strip()
+            rendered_content = _cap_text(rendered_content, _TEXT_CHARS_CAP)
             if rendered_content:
                 parts.append(rendered_content)
             if tool_calls := message.get("tool_calls"):
@@ -1033,6 +1144,7 @@ def _format_messages_as_prompt(
             continue
 
         label = _ROLE_LABELS.get(role, "Context")
+        rendered_content = _cap_text(rendered_content, _TEXT_CHARS_CAP)
         if rendered_content:
             transcript.append(f"{label}:\n{rendered_content}")
 
@@ -1103,7 +1215,41 @@ def _format_delta_prompt(
     ``pending_user_text`` is the latest user request from the full history.
     A tool-result delta does not contain it, so the caller passes it in and it
     is restated after the continue instruction.
+
+    Deltas are small by construction, but a single tool result can still blow
+    past agy's per-frame byte cap (a large file read, a full test log), so the
+    same ladder applies: shrink the new material, then hard-trim as a last
+    resort.
     """
+    budget = prompt_byte_budget()
+    text = ""
+    for tool_cap, text_cap in ((20_000, 0), (4_000, 6_000), (1_000, 1_000)):
+        text = _render_delta_prompt(
+            new_messages,
+            pending_user_text=pending_user_text,
+            media_sink=media_sink,
+            tool_chars_cap=tool_cap,
+            text_chars_cap=text_cap,
+        )
+        if prompt_bytes(text) <= budget:
+            return text
+    logger.warning(
+        "Delta prompt is still %d bytes over the %d-byte budget; trimming it.",
+        prompt_bytes(text) - budget,
+        budget,
+    )
+    return hard_trim(text, budget)
+
+
+def _render_delta_prompt(
+    new_messages: Sequence[dict[str, Any]],
+    pending_user_text: str = "",
+    media_sink: Optional[set] = None,
+    *,
+    tool_chars_cap: int = 20_000,
+    text_chars_cap: int = 0,
+) -> str:
+    """Render the delta prompt with the given per-block caps."""
     valid_messages = [m for m in new_messages if isinstance(m, dict)]
     if not valid_messages:
         return ""
@@ -1123,11 +1269,13 @@ def _format_delta_prompt(
         rendered_content = _render_message_content(msg.get("content"), media_sink)
         if role == "tool":
             tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
-            if len(rendered_content) > 20000:
+            if len(rendered_content) > tool_chars_cap:
+                head = max(int(tool_chars_cap * 0.6), 200)
+                tail = max(tool_chars_cap - head, 100)
                 rendered_content = (
-                    rendered_content[:12000]
+                    rendered_content[:head]
                     + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-3000:]
+                    + rendered_content[-tail:]
                 )
             parts.append(f"Tool Result ({tool_id}):\n{rendered_content}")
             continue
@@ -1135,6 +1283,7 @@ def _format_delta_prompt(
             subparts = []
             if "Tool Result (" in rendered_content:
                 rendered_content = rendered_content.split("Tool Result (")[0].strip()
+            rendered_content = _cap_text(rendered_content, text_chars_cap)
             if rendered_content:
                 subparts.append(rendered_content)
             if tool_calls := msg.get("tool_calls"):
@@ -1154,6 +1303,7 @@ def _format_delta_prompt(
                 parts.append("Assistant:\n" + "\n".join(subparts))
             continue
         label = _ROLE_LABELS.get(role, "Context")
+        rendered_content = _cap_text(rendered_content, text_chars_cap)
         if rendered_content:
             parts.append(f"{label}:\n{rendered_content}")
 

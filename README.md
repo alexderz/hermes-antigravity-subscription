@@ -34,7 +34,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 | Model | Suffix | LLM Context | Plugin Declared | Supported Efforts |
 | :--- | :--- | :--- | :--- | :--- |
-| `gemini-3.8-flash` | `-low`, `-medium`, `-high` | 1M tokens | 239k tokens | `low`, `medium`, `high` |
+| `gemini-3.8-flash` | `-low`, `-medium`, `-high` | 1M tokens | 239k tokens (trajectory) | `low`, `medium`, `high` |
 | `gemini-3.7-flash` | `-low`, `-medium`, `-high` | 1M tokens | 239k tokens | `low`, `medium`, `high` |
 | `gemini-3.6-flash` | `-low`, `-medium`, `-high` | 1M tokens | 239k tokens | `low`, `medium`, `high` |
 | `gemini-3.1-pro` | `-low`, `-high` | 2M tokens | 239k tokens | `low`, `high` |
@@ -46,7 +46,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 > **Claude Model Aliases**: Requests for `claude-sonnet-5-5` or `claude-opus-5-5` resolve dynamically if present in the user's `agy models` catalog; if the account lacks them, they gracefully fall back to `claude-sonnet-4-6` and `claude-opus-4-6-thinking`.
 
-> **Trajectory Persistence & Context Length**: Multi-turn sessions persist across worker restarts via `agy --conversation <id>`, sending only incremental deltas on each turn. This bypasses `agy`'s single-turn 100,000-token prompt trimmer. The plugin declares 239,000 tokens to Hermes (configurable via `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` or `ANTIGRAVITY_CONTEXT_LENGTH`), ensuring Hermes auto-compaction triggers safely below `agy`'s internal checkpoint threshold (239,616 tokens / 256k - 16k output tokens) and preserves sovereign context control. Conversation databases are strictly isolated inside the worker's private temp directory and automatically purged on session resets (`/new`).
+> **Trajectory Persistence & Context Length**: Multi-turn sessions persist across worker restarts via `agy --conversation <id>`, sending only incremental deltas on each turn, so a live conversation is bounded by `agy`'s compiled trajectory checkpoint (239,616 tokens / 256k minus a 16k output reserve) and the plugin declares 239,000 tokens to Hermes for every model (configurable via `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` or `ANTIGRAVITY_CONTEXT_LENGTH`). What binds a *single* turn is a different limit, and it is counted in bytes, not tokens: `agy` 1.5.15 keeps only the first **191,583 bytes** of one prompt frame (measured 2026-11-23 with prompts of 420,544 and 250,378 bytes, which both kept 191,583 bytes) and names the cut in its reply. The prompt builder therefore fits every frame to a byte budget (`HERMES_ANTIGRAVITY_PROMPT_BYTES`, default 94% of the measured cap) along a four-step shrink ladder — older tool results first, then prose, then whole turns with an explicit `EARLIER CONTEXT OMITTED` notice — and the plugin learns a stricter cap from any truncation agy reports. Conversation databases are strictly isolated inside the worker's private temp directory and automatically purged on session resets (`/new`).
 
 ### Prompt recovery and delivery diagnostics
 
@@ -228,6 +228,7 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` | `239000` | Override the declared context window (tokens). Also checks `ANTIGRAVITY_CONTEXT_LENGTH`. Hermes triggers auto-compression based on this value (e.g. at 75% threshold, ~179k tokens). |
+| `HERMES_ANTIGRAVITY_PROMPT_BYTES` | `94%` of the measured cap | Byte budget for one prompt frame. Default derives from the measured 191,583-byte cap of `agy` 1.5.15; the builder fits each send to it. Also checks `ANTIGRAVITY_PROMPT_BYTES`. Set this after measuring a different `agy` build. |
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the `agy` binary. Also checks `AGY_CLI_PATH` and `ANTIGRAVITY_CLI_PATH`. |
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
 | `ANTIGRAVITY_CONFIG_DIR` | (none) | Override the config directory, bypassing keyring and token-file detection. |
