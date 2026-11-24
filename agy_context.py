@@ -17,9 +17,12 @@ are not the model's advertised window.
    what Hermes should compact against, because continuation turns send only a
    delta and never approach the frame cap.
 
-The declared window is therefore one number for every family
-(:data:`TRAJECTORY_CONTEXT`), while :func:`prompt_byte_budget` and
-:func:`fit_to_budget_size` keep individual frames inside the measured cap. If a
+The declared window is the model's published context
+(:func:`model_context_length`, 1,048,576 for the Gemini 4 family), not a
+transport-round number: a live conversation grows through deltas and agy keeps
+its own trajectory, auto-compacting above a threshold it allows to be raised to
+the model window. What the transport does cap is a *single frame*, and
+:func:`prompt_byte_budget` keeps every prompt inside the measured value. If a
 reply still reports a truncation, :func:`note_truncation` learns the real cap
 from it so the next prompt is sized against the observed value.
 """
@@ -36,10 +39,33 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-#: Declared context for every model on this provider: agy's compiled trajectory
-#: checkpoint (239,616 tokens) less a 16k output reserve. Continuation turns are
-#: deltas, so this is the limit that actually binds a live session.
-TRAJECTORY_CONTEXT = 239_000
+# Declared windows are the models' own published context, taken from their
+# OpenRouter cards on 2026-11-23 and, for the Antigravity-only ids, from the
+# Gemini 4 family they route to (google/gemini-4-neon|carbon|argon|hydrogen are
+# 1,048,576 with a 943,718 max output). agy keeps its own trajectory and
+# auto-compacts at a threshold it allows to be set up to the model window
+# (AGY_CLI_AUTO_COMPACT_OVERRIDE, per the 1.5.x changelog), so the model card is
+# the honest number: Hermes compacts first, at its own threshold, and agy's
+# internal compaction stays the backstop rather than the trigger.
+GEMINI_4_CONTEXT = 1_048_576
+CLAUDE_5_CONTEXT = 1_000_000
+CLAUDE_LEGACY_CONTEXT = 200_000
+GPT_OSS_CONTEXT = 131_072
+DEFAULT_CONTEXT = 1_048_576
+
+# Longest-prefix wins, so an effort suffix (``-high``, ``-xhigh``) needs no
+# separate entry.
+_CONTEXT_BY_PREFIX: tuple[tuple[str, int], ...] = (
+    ("gemini-4-", GEMINI_4_CONTEXT),
+    ("gemini-pro-orchestrator", GEMINI_4_CONTEXT),
+    ("gemini-3.8-flash", GEMINI_4_CONTEXT),
+    ("gemini-3.", GEMINI_4_CONTEXT),
+    ("claude-opus-5-5", CLAUDE_5_CONTEXT),
+    ("claude-sonnet-5-5", CLAUDE_5_CONTEXT),
+    ("claude-opus-4-6", CLAUDE_LEGACY_CONTEXT),
+    ("claude-sonnet-4-6", CLAUDE_LEGACY_CONTEXT),
+    ("gpt-oss", GPT_OSS_CONTEXT),
+)
 
 #: Largest single prompt frame observed to survive agy 1.5.15 unchanged.
 MEASURED_SINGLE_TURN_BYTES = 191_583
@@ -116,6 +142,22 @@ def prompt_byte_budget() -> int:
     budget = int(cap * BUDGET_FRACTION)
     # Never let a pathological env value produce a zero-byte budget.
     return max(budget, 4_096)
+
+
+def model_context_length(model: str) -> int:
+    """Published context window for *model*, longest prefix first.
+
+    Unknown ids fall back to :data:`DEFAULT_CONTEXT`; a model we have never seen
+    is far more likely to be another 1M Gemini variant than a small one, and
+    agy's own trajectory limit fails the turn rather than silently truncating if
+    that guess is wrong for a run.
+    """
+    name = (model or "").strip().lower()
+    best: tuple[int, int] | None = None
+    for prefix, size in _CONTEXT_BY_PREFIX:
+        if name.startswith(prefix) and (best is None or len(prefix) > best[0]):
+            best = (len(prefix), size)
+    return best[1] if best else DEFAULT_CONTEXT
 
 
 def prompt_bytes(text: str) -> int:
@@ -220,7 +262,7 @@ def hard_trim(text: str, budget: int) -> str:
 def describe_budget() -> dict[str, Any]:
     """Diagnostic snapshot for logs and tests."""
     return {
-        "declared_context": TRAJECTORY_CONTEXT,
+        "declared_context": DEFAULT_CONTEXT,
         "measured_cap": MEASURED_SINGLE_TURN_BYTES,
         "learned_cap": learned_single_turn_bytes(),
         "effective_cap": single_turn_byte_cap(),

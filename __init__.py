@@ -42,12 +42,15 @@ logger = logging.getLogger(__name__)
 # Context accounting lives in agy_context: the single-prompt-frame cap is a
 # measured BYTE limit (191,583 bytes on agy 1.5.15), not a per-family token
 # guess, and continuation turns send only a delta through --conversation. The
-# declared window is therefore the trajectory checkpoint for every family, and
-# the frame cap is enforced where the prompt is built (prompt.py).
+# declared window is therefore the model's published context (1,048,576 for the
+# Gemini 4 family), and the frame cap is enforced where the prompt is built
+# (prompt.py).
 try:  # plugin package import
-    from .agy_context import TRAJECTORY_CONTEXT as _DEFAULT_CONTEXT_LENGTH
+    from .agy_context import DEFAULT_CONTEXT as _DEFAULT_CONTEXT_LENGTH
+    from .agy_context import model_context_length as _model_context_length
 except ImportError:  # standalone import (tests, plugin dev)
-    from agy_context import TRAJECTORY_CONTEXT as _DEFAULT_CONTEXT_LENGTH  # type: ignore[no-redef]
+    from agy_context import DEFAULT_CONTEXT as _DEFAULT_CONTEXT_LENGTH  # type: ignore[no-redef]
+    from agy_context import model_context_length as _model_context_length  # type: ignore[no-redef]
 _CONTEXT_LENGTH_OVERRIDE_VARS = (
     "HERMES_ANTIGRAVITY_CONTEXT_LENGTHS",
     "ANTIGRAVITY_CONTEXT_LENGTHS",
@@ -81,15 +84,16 @@ def _context_length_overrides() -> dict[str, int]:
 
 
 def resolve_context_length(model: str) -> int:
-    """Declared context for *model*: the multi-turn trajectory checkpoint.
+    """Declared context for *model*: its published window.
 
-    One number for every family, because the binding limit is not per-model any
-    more. A live conversation persists through ``agy --conversation`` and each
-    turn sends only its delta, so the limit a session can grow to is agy's
-    compiled trajectory checkpoint (239,616 tokens) less the 16k output
-    reserve. The single-prompt-frame byte cap (191,583 bytes measured on agy
-    1.5.15) is enforced in :mod:`prompt` by fitting each frame to a budget, so a
-    full send can no longer be silently cut by the transport.
+    The model cards are the source: 1,048,576 for the Gemini 4 family
+    (neon/carbon/argon/hydrogen, the orchestrators and 3.8-flash), 1,000,000 for
+    Claude 5.5, 131,072 for gpt-oss-120b. A live conversation grows through
+    ``agy --conversation`` deltas, and agy keeps its own trajectory, so the
+    model window is the honest ceiling; Hermes compacts at its own threshold,
+    which lands well before agy's internal auto-compaction. The single-frame
+    byte cap (191,583 bytes measured on agy 1.5.15) is enforced in
+    :mod:`prompt` by fitting each frame to a budget.
 
     Overrides still win, exact name first and then the effort-stripped family
     name, so a pinned number in ``*_CONTEXT_LENGTHS`` overrides this.
@@ -99,7 +103,7 @@ def resolve_context_length(model: str) -> int:
     for name in (model.strip().lower(), base):
         if name and name in overrides:
             return overrides[name]
-    return _DEFAULT_CONTEXT_LENGTH
+    return _model_context_length(base or model)
 
 
 class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
@@ -172,10 +176,10 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI.
 
-        Returns the trajectory checkpoint (239,000 tokens) for every model: a
-        live conversation sends only deltas through ``agy --conversation``, so
-        that checkpoint, not the model's advertised window and not a
-        per-family guess, is what Hermes should compact against. The transport
+        Returns the model's published context window (1,048,576 for the Gemini
+        4 family, 1,000,000 for Claude 5.5, 131,072 for gpt-oss-120b) with
+        overrides applied. Hermes compacts against this number; agy keeps its
+        own trajectory and auto-compacts later, as a backstop. The transport
         does cap a *single* prompt frame at a measured 191,583 bytes, and that
         is handled where the prompt is assembled (:mod:`prompt` fits every
         frame to a byte budget and learns the real cap from any truncation agy

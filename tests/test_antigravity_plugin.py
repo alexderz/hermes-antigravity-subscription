@@ -999,11 +999,11 @@ class AntigravityPluginTests(unittest.TestCase):
         # sends only deltas, and the single-frame byte cap is enforced where the
         # prompt is built (see tests/test_context_budget.py), not by declaring a
         # smaller window for a family.
-        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 239_000)
-        self.assertEqual(profile.get_model_context_length("gemini-4-argon-high"), 239_000)
-        self.assertEqual(profile.get_model_context_length("gemini-4-hydrogen"), 239_000)
-        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 239_000)
-        self.assertEqual(profile.get_model_context_length("claude-sonnet-5-5-high"), 239_000)
+        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 1_048_576)
+        self.assertEqual(profile.get_model_context_length("gemini-4-argon-high"), 1_048_576)
+        self.assertEqual(profile.get_model_context_length("gemini-4-hydrogen"), 1_048_576)
+        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
+        self.assertEqual(profile.get_model_context_length("claude-sonnet-5-5-high"), 1_000_000)
 
         # Test env overrides (global, wins over the per-model table)
         with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": "250000"}):
@@ -1032,8 +1032,8 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(profile.get_model_context_length("gemini-4-argon-high"), 64_000)
             self.assertEqual(profile.get_model_context_length("gemini-4-argon-medium"), 90_000)
             self.assertEqual(profile.get_model_context_length("claude-sonnet-5-5-low"), 200_000)
-            # Unrelated families keep their default.
-            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 239_000)
+            # Unrelated families keep their model card.
+            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 1_048_576)
 
         # HERMES_ JSON wins over ANTIGRAVITY_ JSON; malformed JSON is ignored.
         with patch.dict(os.environ, {
@@ -1042,13 +1042,13 @@ class AntigravityPluginTests(unittest.TestCase):
         }):
             self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 80_000)
         with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTHS": "{not json"}):
-            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 239_000)
+            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
         # Non-positive and non-int values are dropped.
         with patch.dict(os.environ, {
             "ANTIGRAVITY_CONTEXT_LENGTHS": json.dumps({"gemini-4-argon": -5, "claude-sonnet-4-6": "abc"}),
         }):
-            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 239_000)
-            self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 239_000)
+            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
+            self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
 
     def test_profile_classify_api_error(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")

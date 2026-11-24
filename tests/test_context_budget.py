@@ -22,8 +22,8 @@ if str(plugin_dir) not in sys.path:
 import agy_context
 from client import _format_delta_prompt, _format_messages_as_prompt
 from agy_context import (
+    GEMINI_4_CONTEXT,
     MEASURED_SINGLE_TURN_BYTES,
-    TRAJECTORY_CONTEXT,
     hard_trim,
     note_truncation,
     parse_truncation_notice,
@@ -34,14 +34,29 @@ from agy_context import (
 
 
 class DeclaredContextTest(unittest.TestCase):
-    def test_every_family_declares_the_trajectory_checkpoint(self):
+    def test_declared_window_follows_the_model_card(self):
         import importlib
 
         entry = importlib.import_module("antigravity_plugin_entry")
         profile = entry.antigravity_profile
-        for model in ("gemini-4-neon", "gemini-4-neon-high", "gemini-4-carbon-low", "claude-opus-5-5"):
+        cases = {
+            "gemini-4-neon": 1_048_576,
+            "gemini-4-neon-high": 1_048_576,
+            "gemini-4-carbon-low": 1_048_576,
+            "gemini-4-hydrogen-xhigh": 1_048_576,
+            "gemini-pro-orchestrator-neon": 1_048_576,
+            "gemini-3.8-flash": 1_048_576,
+            "claude-opus-5-5": 1_000_000,
+            "claude-sonnet-5-5-high": 1_000_000,
+            "claude-sonnet-4-6": 200_000,
+            "gpt-oss-120b-medium": 131_072,
+        }
+        for model, expected in cases.items():
             with self.subTest(model=model):
-                self.assertEqual(profile.get_model_context_length(model), TRAJECTORY_CONTEXT)
+                self.assertEqual(profile.get_model_context_length(model), expected)
+
+    def test_unknown_model_falls_back_to_the_family_default(self):
+        self.assertEqual(agy_context.model_context_length("gemini-9-experimental"), GEMINI_4_CONTEXT)
 
     def test_env_override_still_wins(self):
         import importlib
