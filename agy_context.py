@@ -145,14 +145,35 @@ def prompt_byte_budget() -> int:
 
 
 def model_context_length(model: str) -> int:
-    """Published context window for *model*, longest prefix first.
+    """Context window for *model*: the harness value when known, else the card.
 
-    Unknown ids fall back to :data:`DEFAULT_CONTEXT`; a model we have never seen
-    is far more likely to be another 1M Gemini variant than a small one, and
-    agy's own trajectory limit fails the turn rather than silently truncating if
-    that guess is wrong for a run.
+    Order: what agy itself reported over ACP (:mod:`harness_context`), then the
+    published cards (:data:`_CONTEXT_BY_PREFIX`), then
+    :data:`DEFAULT_CONTEXT`. A discovery run is started in the background when
+    the cache is empty, so the static table only ever serves the first turn or
+    two after a fresh install or an agy upgrade.
     """
     name = (model or "").strip().lower()
+    # The harness knows better than any table: agy reports the window per model
+    # over ACP (session/set_model -> usage_update.size). The cache is filled in
+    # the background, so this is a memo hit, never a subprocess on the hot path.
+    try:
+        from harness_context import lookup as _harness_lookup, refresh_in_background as _refresh
+
+        reported = _harness_lookup(name)
+        if reported:
+            return reported
+        _refresh()
+    except ImportError:
+        try:
+            from .harness_context import lookup as _harness_lookup, refresh_in_background as _refresh
+
+            reported = _harness_lookup(name)
+            if reported:
+                return reported
+            _refresh()
+        except ImportError:  # pragma: no cover - standalone layouts
+            pass
     best: tuple[int, int] | None = None
     for prefix, size in _CONTEXT_BY_PREFIX:
         if name.startswith(prefix) and (best is None or len(prefix) > best[0]):

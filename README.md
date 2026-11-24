@@ -228,6 +228,37 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 
 ## Configuration
 
+### Hermes integration
+
+Beyond inference, the provider answers the hooks Hermes uses to describe and
+configure an external-process route:
+
+| Hook | What it does here |
+| :--- | :--- |
+| `setup_status` | Installed / signed in / plan / detail, from the CLI: the OAuth token file if present, otherwise the CLI's free `usage` read. `agy` signs in interactively, so `login_command` is `None` and the detail says what to do. |
+| `discover_models` | The account's live picker as `[{id, label, note}]` from `agy models`, one row per base model with its effort list — no inference request. |
+| `resolve_aux_model` | Cheapest live id for aux work: `gemini-3.8-flash-low`, then `gemini-4-neon-low`, then any Gemini 4. |
+| `default_vision_model` | The Gemini 4 family (native image input), so a text-only chat model can borrow it for an attached image. |
+| `live_context_length` | The window agy itself reports, discovered over ACP and cached (see below). |
+| `get_model_context_length` | Published card (1,048,576 Gemini 4, 1,000,000 Claude 5.5, 131,072 gpt-oss), with env overrides. |
+| `fetch_account_usage` | The `/usage` quota groups for Hermes's usage meter. |
+| `classify_api_error` | Billing vs auth-permanent vs context-overflow vs transient, for Hermes's failover. |
+| `supported_reasoning_efforts` / `build_api_kwargs_extras` | Effort vocabulary from the live catalog, forwarded to `--effort`. |
+
+**Harness-discovered context windows.** `agy acp` reports the window per model:
+`session/set_model` makes it emit `usage_update {used, size}`. The provider
+opens a session against an isolated home (no tokens, no conversation left
+behind), walks the model bases, and caches the map in
+`$HERMES_HOME/cache/agy_context/windows.json` for seven days or until the agy
+build changes. It happens in the background, so a turn never waits; until it
+lands, the published card is used.
+
+**Compaction ordering.** The provider sets `AGY_CLI_AUTO_COMPACT_OVERRIDE` to
+`90%` (unless you set it) so agy's own compaction stays above Hermes's
+threshold and never discards history behind Hermes's back. Override with
+`ANTIGRAVITY_AUTO_COMPACT` (`0.8M`, `700000`, `80%`) or
+`AGY_CLI_AUTO_COMPACT_OVERRIDE` directly.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -236,6 +267,7 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 | `HERMES_ANTIGRAVITY_PROMPT_BYTES` | `94%` of the measured cap | Byte budget for one prompt frame. Default derives from the measured 191,583-byte cap of `agy` 1.5.15; the builder fits each send to it. Also checks `ANTIGRAVITY_PROMPT_BYTES`. Set this after measuring a different `agy` build. |
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the `agy` binary. Also checks `AGY_CLI_PATH` and `ANTIGRAVITY_CLI_PATH`. |
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
+| `ANTIGRAVITY_AUTO_COMPACT` | `90%` | Value for `AGY_CLI_AUTO_COMPACT_OVERRIDE`; keeps agy's internal compaction later than Hermes's. Accepts a token count, `K`/`M` shorthand, or a percentage of the model window (agy 1.5.15). |
 | `ANTIGRAVITY_CONFIG_DIR` | (none) | Override the config directory, bypassing keyring and token-file detection. |
 | `ANTIGRAVITY_DEBUG_PROMPT_DIR` | (none) | Directory to dump outgoing prompts sent to `agy` for offline diagnosis. |
 | `ANTIGRAVITY_WORKER_IDLE_SECONDS` | `900` | Terminate the persistent `agy` worker after this many seconds without a finished turn. The next turn starts a fresh worker with the full prompt. `0` or a negative value disables the bound. |

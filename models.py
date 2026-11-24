@@ -66,6 +66,7 @@ _CATALOG_TTL_SECONDS = 3600.0
 _CATALOG_FAILURE_TTL_SECONDS = 60.0
 _catalog_lock = threading.Lock()
 _catalog_cache: tuple[float, dict[str, tuple[str, ...]]] | None = None
+_rows_cache: tuple[float, list[dict[str, str]]] | None = None
 
 
 def _normalize_effort(effort: str | None) -> str | None:
@@ -162,6 +163,73 @@ def load_catalog(
         ttl = _CATALOG_TTL_SECONDS if catalog else _CATALOG_FAILURE_TTL_SECONDS
         _catalog_cache = (time.monotonic() + ttl, catalog)
         return catalog
+
+
+def parse_catalog_rows(text: str) -> list[dict[str, str]]:
+    """`agy models` as picker rows: one per base model, with its label and efforts.
+
+    Hermes's ``discover_models`` hook wants ``[{id, label, note}]`` without any
+    inference request. agy prints ``<model-id>\t<Display Name>`` per variant, so
+    the display name of the first variant becomes the row label and the effort
+    list becomes the note.
+    """
+    labels: dict[str, str] = {}
+    order: list[str] = []
+    efforts: dict[str, list[str]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or "fetching" in line.lower() or line.startswith(_SPINNER_CHARS):
+            continue
+        lower_line = line.lower()
+        if any(lower_line.startswith(prefix) for prefix in _SKIP_LINE_PREFIXES):
+            continue
+        parts = line.split("\t", 1)
+        model_id = parts[0].strip().split()[0] if parts[0].strip() else ""
+        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", model_id):
+            continue
+        base, effort = split_effort_suffix(model_id)
+        if base not in efforts:
+            efforts[base] = []
+            order.append(base)
+        if effort and effort not in efforts[base]:
+            efforts[base].append(effort)
+        if base not in labels:
+            display = parts[1].strip() if len(parts) > 1 else ""
+            display = re.sub(r"\s*\((?:low|medium|high|xhigh)\)\s*$", "", display, flags=re.IGNORECASE)
+            labels[base] = display or base
+    rows: list[dict[str, str]] = []
+    for base in order:
+        levels = sorted(efforts[base], key=_EFFORT_RANK.__getitem__)
+        rows.append({"id": base, "label": labels.get(base, base), "note": ", ".join(levels)})
+    return rows
+
+
+def load_catalog_rows(timeout: float = 15.0) -> list[dict[str, str]]:
+    """Picker rows from `agy models`, cached with the same TTL as the catalog."""
+    global _rows_cache
+    try:
+        from .process import _no_window, resolve_agy_command
+    except ImportError:
+        from process import _no_window, resolve_agy_command
+
+    with _catalog_lock:
+        if _rows_cache is not None and time.monotonic() < _rows_cache[0]:
+            return list(_rows_cache[1])
+        try:
+            res = subprocess.run(
+                [resolve_agy_command(), "models"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                **_no_window(),
+            )
+            rows = parse_catalog_rows(res.stdout)
+        except Exception as exc:
+            logger.debug("Antigravity picker catalog unavailable: %s", exc)
+            rows = []
+        ttl = _CATALOG_TTL_SECONDS if rows else _CATALOG_FAILURE_TTL_SECONDS
+        _rows_cache = (time.monotonic() + ttl, rows)
+        return list(rows)
 
 
 def _cached_catalog() -> dict[str, tuple[str, ...]] | None:

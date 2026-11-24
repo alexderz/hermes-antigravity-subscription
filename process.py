@@ -1042,6 +1042,20 @@ def build_child_env(isolated_home: Path | str) -> dict[str, str]:
     # Windows even when agy itself is hidden. An explicit parent value wins.
     env.setdefault("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
 
+    # Keep agy's own compaction above Hermes's threshold (see setup_hooks): with
+    # a declared window of 1M, Hermes compacts at 524k, so agy must not discard
+    # history at, say, 60% behind its back. 90% leaves agy as the backstop.
+    if "AGY_CLI_AUTO_COMPACT_OVERRIDE" not in env:
+        try:
+            from .setup_hooks import auto_compact_override
+        except ImportError:
+            try:
+                from setup_hooks import auto_compact_override
+            except ImportError:
+                auto_compact_override = None
+        if auto_compact_override is not None:
+            env["AGY_CLI_AUTO_COMPACT_OVERRIDE"] = auto_compact_override()
+
     # agy 1.2.16 detects SSH sessions via SSH_CONNECTION, SSH_CLIENT, or SSH_TTY
     # and forces file-based token storage ("Using file-based token storage because
     # SSH session detected"). When credentials live in the OS keyring and no real
@@ -1102,12 +1116,20 @@ def _check_early_quota_error(
                 "ai credits balance is too low" in lower_line
                 or "credits balance is too low" in lower_line
                 or "daily or billing cap" in lower_line
+                or "spend cap" in lower_line
+                or "prepaid balance" in lower_line
             ):
                 return line.strip()
+            # agy retries plain 429s itself (up to ~4 minutes since 1.5.10), so a
+            # bare RESOURCE_EXHAUSTED/code 429 is NOT evidence the turn is dead:
+            # aborting on it would fail a turn agy was about to complete. Only a
+            # quota or billing verdict that will not clear on retry ends the turn.
             if "RESOURCE_EXHAUSTED" in line and (
-                "Individual quota reached" in line
+                "individual quota reached" in lower_line
                 or "quota exceeded" in lower_line
-                or "code 429" in line
+                or "spend cap" in lower_line
+                or "prepaid" in lower_line
+                or "weekly limit" in lower_line
             ):
                 start = line.find("RESOURCE_EXHAUSTED")
                 if start != -1:

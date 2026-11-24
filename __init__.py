@@ -238,6 +238,80 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
 
         return get_account_usage_snapshot(force_refresh=force_refresh)
 
+    def live_context_length(self, model: str, *, api_key: str = "", base_url: str = "") -> int | None:
+        """Context window the harness itself reports for *model*, if it has said.
+
+        agy answers this over ACP: ``session/set_model`` makes it emit
+        ``usage_update.size`` for that model, which is its real window. The
+        first turn after an install (or after an agy upgrade) starts a
+        background discovery run and returns None, so Hermes falls back to the
+        published card; later calls read the cache.
+        """
+        try:
+            try:
+                from .harness_context import lookup, refresh_in_background
+            except ImportError:
+                from harness_context import lookup, refresh_in_background
+            reported = lookup(model)
+            if reported:
+                return reported
+            refresh_in_background()
+        except Exception as exc:  # never break context resolution
+            logger.debug("agy live context lookup failed: %s", exc)
+        return None
+
+    def setup_status(self, **kwargs: Any) -> dict[str, Any]:
+        """Installed / signed-in / plan / detail from the CLI itself."""
+        try:
+            try:
+                from .setup_hooks import setup_status as _setup_status
+            except ImportError:
+                from setup_hooks import setup_status as _setup_status
+            return _setup_status(**kwargs)
+        except Exception as exc:
+            logger.debug("Antigravity setup_status failed: %s", exc)
+            return {
+                "available": bool(resolve_agy_command()),
+                "logged_in": False,
+                "plan": "",
+                "detail": str(exc),
+                "login_command": None,
+            }
+
+    def discover_models(self, **kwargs: Any) -> list[dict[str, str]] | None:
+        """The account's live picker as ``[{id, label, note}]``, no inference."""
+        try:
+            try:
+                from .setup_hooks import discover_models as _discover_models
+            except ImportError:
+                from setup_hooks import discover_models as _discover_models
+            return _discover_models(**kwargs)
+        except Exception as exc:
+            logger.debug("Antigravity discover_models failed: %s", exc)
+            return None
+
+    def resolve_aux_model(self) -> str:
+        """Cheapest live model id for auxiliary tasks, or ""."""
+        try:
+            try:
+                from .setup_hooks import resolve_aux_model as _resolve_aux_model
+            except ImportError:
+                from setup_hooks import resolve_aux_model as _resolve_aux_model
+            return _resolve_aux_model()
+        except Exception:
+            return ""
+
+    def default_vision_model(self) -> str | None:
+        """A model on this provider that accepts images natively."""
+        try:
+            try:
+                from .setup_hooks import default_vision_model as _default_vision_model
+            except ImportError:
+                from setup_hooks import default_vision_model as _default_vision_model
+            return _default_vision_model()
+        except Exception:
+            return None
+
 
 def _classify_antigravity_error(
     error: Exception,
