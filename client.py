@@ -673,12 +673,16 @@ class AntigravityClient:
             self._worker_last_activity.pop(proc, None)
             self._worker_cpu_at_activity.pop(proc, None)
             self._terminate_process(proc)
-        # The session is gone: any later usage from it belongs to a dead
-        # session, and the next spawn must start from a clean baseline.
-        self._worker_usage_baseline = {}
-        # Full-send diagnostics compare only fresh-context requests, never
-        # session counters or deltas. Their reference survives worker resets.
-        if not keep_conversation:
+        # A dropped conversation starts clean. A resumed one (--conversation)
+        # does not: agy keeps cumulative counters across that respawn, so the
+        # numbers must survive or the next call is billed as the whole
+        # session. Replace the dict either way. The dying stream captured the
+        # old object and must not be able to write into the session that
+        # replaces it.
+        if keep_conversation:
+            self._worker_usage_baseline = dict(self._worker_usage_baseline)
+        else:
+            self._worker_usage_baseline = {}
             self._worker_conversation_id = None
             self._conversation_history = []
 
@@ -908,7 +912,10 @@ class AntigravityClient:
             # permissions only at spawn (verified: rewriting the file under a
             # live worker changes nothing for its next turn).
             self._worker_media_rules = read_media_rules(self._isolated_gemini_dir)
-            self._worker_usage_baseline = {}
+            # Baseline was already replaced by _terminate_worker_locked above:
+            # cleared for a new conversation, copied when this spawn resumes
+            # one. Do not zero it again here or a --conversation resume bills
+            # the whole session on the first call.
             self._active_processes.add(proc)
             register_tracked_process(proc)
             self._worker_last_activity[proc] = time.monotonic()

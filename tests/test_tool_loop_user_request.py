@@ -85,6 +85,30 @@ class TestToolLoopKeepsUserRequest(unittest.TestCase):
         self.assertNotIn("USER REQUEST THIS TOOL LOOP IS SERVING", prompt)
         self.assertEqual(prompt.count(QUESTION), 1)
 
+    def test_compaction_summary_is_not_restated(self):
+        padding = "x" * 20_000
+        summary = (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] " + padding
+            + "\n## User Messages (verbatim, newest first)\n> Fix the plugin\n"
+            + "\n--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\n"
+            + "[STILL IN PROGRESS — this is the active request, restated after the "
+            + "compaction boundary because it was not finished yet. Continue it; do not start over.]\n"
+            + "Fix the plugin"
+        )
+        history = [
+            {"role": "user", "content": summary},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "patched"},
+        ]
+        self.assertEqual(_latest_user_text(history), "Fix the plugin")
+        prompt = _format_delta_prompt(history[-2:], pending_user_text=_latest_user_text(history))
+        self.assertNotIn("CONTEXT COMPACTION", prompt)
+        self.assertNotIn(padding[:40], prompt)
+        self.assertIn("Fix the plugin", prompt)
+        as_user_delta = _format_delta_prompt([{"role": "user", "content": summary}])
+        self.assertNotIn(padding[:40], as_user_delta)
+        self.assertIn("Fix the plugin", as_user_delta)
+
 
 if __name__ == "__main__":
     unittest.main()

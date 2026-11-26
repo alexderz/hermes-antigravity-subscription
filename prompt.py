@@ -880,6 +880,9 @@ def _render_message_content(content: Any, media_sink: Optional[set] = None) -> s
 
 def _latest_user_request_section(user_text: str) -> str:
     """Format the canonical LATEST USER REQUEST section and anti-loop instruction."""
+    user_text = _request_for_restatement(user_text)
+    if not user_text:
+        return ""
     return (
         f"### LATEST USER REQUEST TO ANSWER:\nUser:\n{user_text}\n\n"
         "INSTRUCTION: Respond directly and specifically to the LATEST USER REQUEST above. "
@@ -902,23 +905,97 @@ def _is_recovery_nudge(message: dict[str, Any]) -> bool:
     )
 
 
+# Hermes compaction folds the live request into one user message that starts
+# with this prefix. Restating that message on every agy delta re-sends the
+# whole summary (hundreds of KB) and blows the frame cap.
+_COMPACTION_SUMMARY_PREFIX = "[CONTEXT COMPACTION"
+_SUMMARY_END_MARKER = "--- END OF CONTEXT SUMMARY"
+_INFLIGHT_REPLAY_PREFIX = "[STILL IN PROGRESS"
+_USER_MESSAGES_HEADING = "## User Messages (verbatim, newest first)"
+# A restated request is a pointer, not a second copy of the transcript.
+_RESTATED_REQUEST_CAP = 2_000
+
+
+def _is_compaction_summary_text(text: str) -> bool:
+    head = text.lstrip()
+    return head.startswith(_COMPACTION_SUMMARY_PREFIX) or head.startswith("[PRIOR CONTEXT")
+
+
+def _cap_restated_request(text: str) -> str:
+    text = text.strip()
+    if len(text) <= _RESTATED_REQUEST_CAP:
+        return text
+    return text[:_RESTATED_REQUEST_CAP].rstrip() + "…"
+
+
+def _extract_request_from_summary(text: str) -> str:
+    """The live ask inside a compaction summary, never the summary itself.
+
+    Prefer the in-flight replay Hermes appends after the end marker. Fall
+    back to the newest verbatim user line. Empty when neither is present:
+    the summary is already in the conversation, and pasting it again is the
+    failure this exists to stop.
+    """
+    if _SUMMARY_END_MARKER in text:
+        after = text.split(_SUMMARY_END_MARKER, 1)[1]
+        newline = after.find("\n")
+        after = after[newline + 1:] if newline >= 0 else ""
+        after = after.strip()
+        if after.startswith(_INFLIGHT_REPLAY_PREFIX):
+            close = after.find("]")
+            after = after[close + 1:].strip() if close >= 0 else ""
+        if after:
+            return _cap_restated_request(after)
+    heading = text.find(_USER_MESSAGES_HEADING)
+    if heading >= 0:
+        section = text[heading + len(_USER_MESSAGES_HEADING):]
+        nxt = section.find("\n## ")
+        if nxt >= 0:
+            section = section[:nxt]
+        for line in section.splitlines():
+            quoted = line.strip()
+            if quoted.startswith("> "):
+                return _cap_restated_request(quoted[2:])
+    return ""
+
+
+def _request_for_restatement(text: str) -> str:
+    """Text safe to repeat on a later agy turn. Summaries are not."""
+    if not text:
+        return ""
+    if _is_compaction_summary_text(text):
+        return _extract_request_from_summary(text)
+    return text
+
+
 def _latest_user_text(messages: Sequence[Any]) -> str:
-    """Return the rendered text of the last user message, or an empty string."""
+    """Return the rendered text of the last user message, or an empty string.
+
+    A compaction summary is not the request. Return only the live ask it
+    carries, so a tool-result delta cannot re-send the summary.
+    """
     for msg in reversed(list(messages or [])):
         if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() == "user":
             if not _is_recovery_nudge(msg):
-                return _render_message_content(msg.get("content"))
+                return _request_for_restatement(_render_message_content(msg.get("content")))
     return ""
 
 
 def _pending_user_request_section(user_text: str) -> str:
     """Restate the user request that the current tool loop is serving.
 
+    A compaction summary passed here is reduced to its live ask. The summary
+    body must never be appended to a delta.
+
     Tool-result turns otherwise end with a generic "continue" line, so after a
     few tool calls the request falls far behind the newest text the model sees
     and the model drifts back to the dominant pattern in the transcript (for
     example re-sending an earlier completion report).
     """
+    user_text = _request_for_restatement(user_text)
+    if not user_text:
+        return ""
+
     return (
         f"### USER REQUEST THIS TOOL LOOP IS SERVING:\nUser:\n{user_text}\n\n"
         "INSTRUCTION: Use the tool results only to answer THIS request. "
@@ -1318,6 +1395,7 @@ def _render_delta_prompt(
             parts.append(_pending_user_request_section(pending_user_text))
     elif last_role == "user":
         user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"), media_sink)
+        user_text = _request_for_restatement(user_text)
         if user_text:
             parts.append(_latest_user_request_section(user_text))
     else:

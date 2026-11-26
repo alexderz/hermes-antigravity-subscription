@@ -286,6 +286,43 @@ class WorkerTurnUsageTests(unittest.TestCase):
         self.assertEqual(usage2.total_tokens, 115)  # fallback: 90 + 25
         self.assertEqual(client._worker_usage_baseline, {"input_tokens": 90, "output_tokens": 45})
 
+    def test_conversation_resume_keeps_usage_baseline(self):
+        """agy --conversation keeps cumulative counters. A respawn must delta, not rebill."""
+        client = self._client()
+        models = _mock_proc([])
+        dead = _mock_proc(
+            _turn_lines(
+                _turn_events(
+                    "conv-1",
+                    "answer one",
+                    {"input_tokens": 200, "output_tokens": 20, "total_tokens": 220, "cache_read_tokens": 40},
+                )
+            )
+        )
+        resumed = _mock_proc(
+            _turn_lines(
+                _turn_events(
+                    "conv-1",
+                    "answer two",
+                    {"input_tokens": 350, "output_tokens": 30, "total_tokens": 380, "cache_read_tokens": 90},
+                )
+            )
+        )
+        with patch("subprocess.Popen", side_effect=[models, dead, resumed]) as popen:
+            usage1 = _usage_of(
+                list(client.chat.completions.create(model=MODEL, messages=MESSAGES_TURN_1, stream=True))
+            )
+            self.assertEqual((usage1.prompt_tokens, usage1.completion_tokens), (200, 20))
+            dead.poll.return_value = 0
+            usage2 = _usage_of(
+                list(client.chat.completions.create(model=MODEL, messages=MESSAGES_TURN_2, stream=True))
+            )
+        self.assertEqual((usage2.prompt_tokens, usage2.completion_tokens), (150, 10))
+        self.assertEqual(usage2.prompt_tokens_details.cached_tokens, 50)
+        resume_cmd = popen.call_args_list[-1].args[0]
+        self.assertIn("--conversation", resume_cmd)
+        self.assertIn("conv-1", resume_cmd)
+
     def test_omitted_optional_fields_do_not_reset_unrelated_counters(self):
         client = self._client()
         proc = _mock_proc(

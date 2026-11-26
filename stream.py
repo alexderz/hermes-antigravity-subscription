@@ -1176,12 +1176,11 @@ class AntigravityStream(Iterator[Any]):
                 # chunk is never yielded on a raised turn, so the spent
                 # tokens reach no consumer either way -- and NOT advancing is
                 # provably safe: the finally below closes this worker
-                # (success is False), and client._terminate_worker_locked /
-                # _get_or_spawn_worker reset _worker_usage_baseline on
-                # termination and on respawn, so the stale snapshot is
-                # discarded together with the dead session instead of
-                # poisoning the respawned worker's deltas. Oneshot streams
-                # carry no baseline at all.
+                # (success is False), and that close drops the conversation,
+                # which clears _worker_usage_baseline. A --conversation resume
+                # keeps the numbers (agy's counters continue) but replaces
+                # the dict, so this stream cannot write into the next
+                # session. Oneshot streams carry no baseline at all.
                 #
                 # Success is now REQUIRED to emit finish/usage, the security
                 # neutralization above being the only exception (pinned by
