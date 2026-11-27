@@ -559,8 +559,8 @@ _PROMPT_PREAMBLE = (
     "All tool executions and filesystem interactions are performed exclusively by Hermes Agent on the host side.",
     "IMPORTANT INSTRUCTIONS FOR TOOLS:",
     "- If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text output—NEVER use the native functionCall / tool_use channel.",
-    "- Each <tool_call> block must contain a single valid JSON object with 'id' (unique per call), 'type': 'function', and 'function': {'name': '...', 'arguments': '...'}." ,
-    "- 'arguments' must be a valid, properly JSON-escaped string encoding the function's arguments object.",
+    "- Each <tool_call> block must contain a single valid JSON object with 'id' (unique per call), 'type': 'function', and 'function': {'name': '...', 'arguments': {...}}." ,
+    "- 'arguments' should be a plain JSON object matching the tool's parameter schema (no double-JSON-escaping needed; a JSON-encoded string is also accepted).",
     "- Do NOT execute local shell commands or file operations directly; only output <tool_call> tags so Hermes can execute them safely.",
     "- NEVER simulate or hallucinate Tool Results (e.g. 'Tool Result (...):'). Hermes Agent executes tools externally and will supply real results in subsequent turns.",
     "- After emitting tool calls, STOP generating immediately. Do NOT generate results, execution output, or commentary after tool calls.",
@@ -1212,7 +1212,7 @@ def _render_prompt(
                             "type": "function",
                             "function": {
                                 "name": fn.get("name", ""),
-                                "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                                "arguments": _arguments_for_prompt(fn.get("arguments", "{}")),
                             }
                         }
                         parts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
@@ -1372,7 +1372,7 @@ def _render_delta_prompt(
                             "type": "function",
                             "function": {
                                 "name": fn.get("name", ""),
-                                "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                                "arguments": _arguments_for_prompt(fn.get("arguments", "{}")),
                             }
                         }
                         subparts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
@@ -1388,7 +1388,7 @@ def _render_delta_prompt(
         parts.append(
             "Continue the conversation from the latest tool result. "
             "REMINDER: You are in HEADLESS INFERENCE MODE. Native function-calling and native tools are disabled. "
-            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text with valid JSON and a properly JSON-escaped 'arguments' string. "
+            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text with valid JSON and a JSON object for 'arguments'. "
             "Never invoke native tools or emit native functionCall blocks."
         )
         if pending_user_text:
@@ -1466,6 +1466,87 @@ def _has_unfinished_tool_call_frame(
         cursor = end
 
 
+_JSON_VALID_ESCAPES = frozenset('"\\/bfnrt')
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _escape_invalid_backslashes_in_json_strings(raw: str) -> str:
+    """Double invalid ``\\X`` escape sequences inside JSON string values (e.g. regex
+    ``\\s``, ``\\.``, ``\\'``) while leaving valid JSON escapes intact."""
+    out: list[str] = []
+    in_string = False
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 < n:
+                nxt = raw[i + 1]
+                if nxt in _JSON_VALID_ESCAPES:
+                    out.append(raw[i:i + 2])
+                    i += 2
+                    continue
+                if nxt == "u" and i + 5 < n and all(c in _HEX_DIGITS for c in raw[i + 2:i + 6]):
+                    out.append(raw[i:i + 6])
+                    i += 6
+                    continue
+            out.append("\\\\")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _arguments_for_prompt(raw_args: Any) -> Any:
+    """Render tool-call arguments as a plain JSON object in prompt transcripts
+    when they parse as one, so models imitate single-encoded JSON instead of
+    error-prone double-escaped JSON strings."""
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+        return raw_args
+    return raw_args if raw_args is not None else {}
+
+
+def _normalize_tool_arguments(fn_args: Any) -> str:
+    """Return a JSON string for tool arguments, repairing invalid backslash
+    escapes or literal control chars inside string-encoded JSON when possible."""
+    if not isinstance(fn_args, str):
+        return json.dumps(fn_args, ensure_ascii=False)
+    if not fn_args.strip():
+        return fn_args
+    try:
+        json.loads(fn_args)
+        return fn_args
+    except Exception:
+        pass
+    try:
+        repaired = json.loads(
+            _escape_invalid_backslashes_in_json_strings(fn_args),
+            strict=False,
+        )
+        return json.dumps(repaired, ensure_ascii=False)
+    except Exception:
+        return fn_args
+
+
 def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
     """Build one tool-call delta object from a decoded JSON value.
 
@@ -1485,9 +1566,7 @@ def _tool_call_from_object(obj: Any, ordinal: int) -> Any | None:
     call_id = obj.get("id")
     if not isinstance(call_id, str) or not call_id.strip():
         call_id = f"call_{ordinal}"
-    fn_args = fn.get("arguments", "{}")
-    if not isinstance(fn_args, str):
-        fn_args = json.dumps(fn_args, ensure_ascii=False)
+    fn_args = _normalize_tool_arguments(fn.get("arguments", "{}"))
     return SimpleNamespace(
         id=call_id,
         type="function",
@@ -1567,7 +1646,13 @@ def _extract_tagged_tool_calls(
         try:
             parsed = json.loads(body)
         except Exception:
-            parsed = None
+            try:
+                parsed = json.loads(
+                    _escape_invalid_backslashes_in_json_strings(body),
+                    strict=False,
+                )
+            except Exception:
+                parsed = None
         call = _tool_call_from_object(parsed, len(calls) + 1)
         if call is None:
             text_parts.append(block[start:end])
@@ -1583,6 +1668,92 @@ def _extract_tagged_tool_calls(
     return calls, "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
 
 
+_TOOL_CALL_JSON_START_RE = re.compile(
+    r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{",
+    re.DOTALL,
+)
+
+
+def _find_balanced_json_object_end(text: str, start: int) -> int:
+    """Return end index (exclusive) of the JSON object starting at ``start``, or -1
+    if unbalanced. String-aware so braces inside string values do not confuse depth."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def _extract_bare_json_tool_calls(block: str) -> tuple[list[Any], str]:
+    """Fallback extractor for untagged bare-JSON tool call objects.
+
+    Uses string-aware brace balancing so plain JSON object ``arguments`` (and
+    nested objects) parse cleanly even when running against older Hermes versions
+    whose ``acp_openai_bridge.TOOL_CALL_JSON_RE`` assumes string-only arguments.
+    """
+    if not isinstance(block, str) or not block.strip():
+        return [], ""
+    calls: list[Any] = []
+    consumed_spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        m = _TOOL_CALL_JSON_START_RE.search(block, cursor)
+        if m is None:
+            break
+        end = _find_balanced_json_object_end(block, m.start())
+        if end == -1:
+            cursor = m.end()
+            continue
+        body = block[m.start():end]
+        parsed = None
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            try:
+                parsed = json.loads(
+                    _escape_invalid_backslashes_in_json_strings(body),
+                    strict=False,
+                )
+            except Exception:
+                parsed = None
+        call = _tool_call_from_object(parsed, len(calls) + 1)
+        if call is not None:
+            calls.append(call)
+            consumed_spans.append((m.start(), end))
+            cursor = end
+        else:
+            cursor = m.start() + 1
+    if not consumed_spans:
+        return [], block.strip()
+    parts: list[str] = []
+    pos = 0
+    for start, end in consumed_spans:
+        if pos < start:
+            parts.append(block[pos:start])
+        pos = max(pos, end)
+    if pos < len(block):
+        parts.append(block[pos:])
+    cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
+    return calls, cleaned
+
+
 def _parse_tool_block(
     block: str, state: _MarkdownCodeState | None = None
 ) -> tuple[list[Any], str]:
@@ -1592,19 +1763,13 @@ def _parse_tool_block(
     if _TOOL_CALL_OPEN in block:
         calls, cleaned_text = _extract_tagged_tool_calls(block, state=state)
     else:
-        try:
-            from agent.acp_openai_bridge import extract_tool_calls_from_text
-            calls, cleaned_text = extract_tool_calls_from_text(block)
-        except Exception:
-            cleaned_text = block
+        calls, cleaned_text = _extract_bare_json_tool_calls(block)
 
     deltas = []
     for i, call in enumerate(calls):
         fn = getattr(call, "function", None)
         name = getattr(fn, "name", "") if fn else ""
-        args = getattr(fn, "arguments", "{}") if fn else "{}"
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
+        args = _normalize_tool_arguments(getattr(fn, "arguments", "{}") if fn else "{}")
         deltas.append(
             SimpleNamespace(
                 index=i,

@@ -670,3 +670,82 @@ def test_prose_ending_with_lone_angle_bracket_after_a_complete_call_succeeds():
 
     assert [call.id for call in calls] == ["same"]
     assert finishes == ["tool_calls"]
+
+
+def test_prompt_and_history_use_plain_json_object_arguments():
+    from prompt import _PROMPT_PREAMBLE, _format_delta_prompt, _format_messages_as_prompt
+
+    preamble = "\n".join(_PROMPT_PREAMBLE)
+    assert "'arguments': {...}" in preamble
+    assert "JSON object" in preamble
+
+    messages = [
+        {"role": "user", "content": "check logs"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": r'{"command": "echo \"hi\""}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "hi"},
+    ]
+    full_prompt = _format_messages_as_prompt(messages)
+    delta_prompt = _format_delta_prompt(messages[1:], pending_user_text="check logs")
+    expected_obj = r'"arguments": {"command": "echo \"hi\""}'
+    assert expected_obj in full_prompt
+    assert expected_obj in delta_prompt
+    assert "JSON object for 'arguments'" in delta_prompt
+
+
+def test_parse_tool_block_accepts_object_arguments_and_repairs_invalid_escapes():
+    body = (
+        r'{"id": "c1", "type": "function", "function": {'
+        r'"name": "search_files", '
+        r'"arguments": {"pattern": "foo\s+bar\.py|\'baz\'\n\u0041"}}}'
+    )
+    calls, cleaned = _parse_tool_block(f"<tool_call>{body}</tool_call>")
+    assert len(calls) == 1
+    assert calls[0].function.name == "search_files"
+    assert json.loads(calls[0].function.arguments) == {
+        "pattern": "foo\\s+bar\\.py|\\'baz\\'\nA"
+    }
+    assert cleaned == ""
+
+
+def test_parse_tool_block_repairs_string_encoded_arguments_with_invalid_escapes():
+    body = (
+        r'{"id": "c1", "type": "function", "function": {'
+        r'"name": "search_files", '
+        r'"arguments": "{\"pattern\": \"foo\s+bar\"}"}}'
+    )
+    calls, cleaned = _parse_tool_block(f"<tool_call>{body}</tool_call>")
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"pattern": r"foo\s+bar"}
+    assert cleaned == ""
+
+
+def test_parse_tool_block_bare_json_fallback_handles_object_arguments():
+    bare = r'{"id":"c1","type":"function","function":{"name":"search_files","arguments":{"pattern":"foo\s+bar","nested":{"brace":"}"}}}}'
+    calls, cleaned = _parse_tool_block(f"lead {bare} trail")
+    assert len(calls) == 1
+    assert calls[0].function.name == "search_files"
+    assert json.loads(calls[0].function.arguments) == {
+        "pattern": r"foo\s+bar",
+        "nested": {"brace": "}"},
+    }
+    assert cleaned == "lead\ntrail"
+
+
+def test_parse_tool_block_bare_json_fallback_leaves_unparseable_text_untouched():
+    raw = '{"id":"c1","type":"function","function":{"name":"search_files","arguments":{not valid}}'
+    calls, cleaned = _parse_tool_block(raw)
+    assert calls == []
+    assert cleaned == raw
